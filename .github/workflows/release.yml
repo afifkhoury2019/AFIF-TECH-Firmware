@@ -75,8 +75,8 @@ jobs:
         env:
           V: ${{ steps.ver.outputs.version }}
         run: |
-          mkdir -p ota
           git rm -q --ignore-unmatch 'ota/*.bin'
+          mkdir -p ota
           cp WaterTank_D1Mini.ino.bin "ota/WaterTank_D1Mini-$V.bin"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
