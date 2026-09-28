@@ -219,7 +219,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 
 // Firmware version, reported on <topic>/version so the app can show what is
 // installed and confirm that an update worked. Raise it for every release.
-#define FW_VERSION     "2.2.9"
+#define FW_VERSION     "2.2.10"
 
 // ─────────────────────────────────────────────────────────────
 WiFiClient              espClient;
