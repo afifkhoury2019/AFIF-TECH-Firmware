@@ -1,0 +1,117 @@
+name: Build & publish firmware
+
+on:
+  push:
+    branches: [ main, master ]
+    paths: [ 'WaterTank_D1Mini/**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read FW_VERSION from the sketch
+        id: ver
+        run: |
+          V=$(grep -oP '#define\s+FW_VERSION\s+"\K[^"]+' WaterTank_D1Mini/WaterTank_D1Mini.ino || true)
+          if [ -z "$V" ]; then echo "::error::FW_VERSION not found in the sketch"; exit 1; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Firmware version: $V"
+
+      - name: Stop if this version was already released
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "::error::Release v$V already exists. Raise FW_VERSION in the sketch to publish a new firmware."
+            exit 1
+          fi
+
+      - name: Write the signing key (from the SIGNING_KEY secret)
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::Add the SIGNING_KEY secret: Settings > Secrets and variables > Actions > New repository secret"
+            exit 1
+          fi
+          printf '%s\n' "$SIGNING_KEY" > WaterTank_D1Mini/private.key
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP8266 core 3.1.2 and libraries
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp8266:esp8266@3.1.2
+          arduino-cli lib install "PubSubClient@2.8" "U8g2"
+
+      - name: Compile (default flash layout 4MB FS:2MB OTA:~1019KB)
+        run: arduino-cli compile --fqbn esp8266:esp8266:d1_mini --export-binaries --output-dir build WaterTank_D1Mini
+
+      - name: Check the signature
+        run: |
+          rm -f WaterTank_D1Mini/private.key
+          python3 - <<'PY'
+          import struct, subprocess, sys
+          d = open('build/WaterTank_D1Mini.ino.bin.signed', 'rb').read()
+          n = struct.unpack('<I', d[-4:])[0]
+          open('payload.bin', 'wb').write(d[:-(n + 4)]); open('sig.bin', 'wb').write(d[-(n + 4):-4])
+          r = subprocess.run(['openssl', 'dgst', '-sha256', '-verify', 'WaterTank_D1Mini/public.key',
+                              '-signature', 'sig.bin', 'payload.bin'], capture_output=True, text=True)
+          print(r.stdout or r.stderr)
+          sys.exit(0 if 'Verified OK' in r.stdout else 1)
+          PY
+          cp build/WaterTank_D1Mini.ino.bin.signed WaterTank_D1Mini.ino.bin
+
+      - name: Store the firmware in the repository (direct link, no redirect)
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p ota
+          git rm -q --ignore-unmatch 'ota/*.bin'
+          cp WaterTank_D1Mini.ino.bin "ota/WaterTank_D1Mini-$V.bin"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ota
+          git commit -q -m "Firmware $V binary"
+          git push
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.version }}
+          REPO: ${{ github.repository }}
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          v, repo = os.environ["V"], os.environ["REPO"]
+          json.dump({
+              "version": v,
+              "bin": f"https://raw.githubusercontent.com/{repo}/main/ota/WaterTank_D1Mini-{v}.bin",
+              "notes": (os.environ.get("NOTES") or f"Firmware {v}")[:400],
+          }, open("version.json", "w"))
+          PY
+          cat version.json
+          gh release create "v$V" WaterTank_D1Mini.ino.bin version.json \
+            --title "Firmware $V" \
+            --notes "${NOTES:-Firmware $V}" \
+            --latest
+
+      - name: Announce the release to the apps (instant, over MQTT)
+        env:
+          V: ${{ steps.ver.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          sudo apt-get install -y -qq mosquitto-clients >/dev/null
+          mosquitto_pub -h broker.emqx.io -p 1883 -q 1 -r \
+            -t "afiftech/fw/$REPO" -m "{\"version\":\"$V\"}" \
+            || echo "Announcement failed - apps will still find it within 15 minutes"
